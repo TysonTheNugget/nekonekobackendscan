@@ -12,7 +12,7 @@ import zlib from "zlib";
  * - INSCRIPTION_CONTENT_HOST: e.g., https://ordinals.com/content
  * - PNG_TEXT_KEY_HINT: preferred key inside PNG text chunks (default "Serial")
  * - SCAN_SINCE_UNIX: optional override (unix seconds). Default = 2025-08-27 00:00:00 UTC
- * - SCAN_RETRY_LIMIT: attempts before giving up and marking seen (default 12)
+ * - SCAN_RddETRY_LIMIT: attempts before giving up and marking seen (default 12)
  * - SCAN_RETRY_TTL_SEC: TTL for retry counter (default 7200)
  */
 
