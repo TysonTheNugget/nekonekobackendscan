@@ -49,7 +49,7 @@ async function scanAddress(address) {
   const hits = [];
   for (const tx of all) {
     const txid = tx.txid;
-    // skip if we've already processed this txid
+    // skip if we've already processed this txisd
     const already = await REDIS.sismember("seen_txids", txid);
     if (already) continue;
 
