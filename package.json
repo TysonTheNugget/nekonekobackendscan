@@ -1,0 +1,9 @@
+{
+  "name": "btc-insc-watcher",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@upstash/redis": "1.31.6",
+    "node-fetch": "3.3.2"
+  }
+}
