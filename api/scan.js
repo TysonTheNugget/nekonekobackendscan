@@ -22,7 +22,7 @@ const REDIS = new Redis({
 });
 
 const MEMPOOL = "https://mempool.space/api";
-const CONTENT_HOST = process.env.INSCRIPTION_CONTENT_HOST || "https://ordinals.com/content";
+const CONTENT_HOST = process.env.INSCRIPTION_CONTENT_HOST || "https://static.unisat.io/content";
 const PNG_TEXT_KEY_HINT = process.env.PNG_TEXT_KEY_HINT || "Serial";
 
 const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
