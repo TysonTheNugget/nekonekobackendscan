@@ -3,29 +3,61 @@ import { Redis } from "@upstash/redis";
 import fetch from "node-fetch";
 import zlib from "zlib";
 
+/**
+ * ENV
+ * - UPSTASH_REDIS_REST_URL
+ * - UPSTASH_REDIS_REST_TOKEN
+ * - WATCH_ADDRESSES: comma-separated fee/commit addresses to watch
+ * - SCAN_CHAIN_PAGES: how many chain pages to fetch per address (default 1)
+ * - INSCRIPTION_CONTENT_HOST: e.g., https://ordinals.com/content
+ * - PNG_TEXT_KEY_HINT: preferred key inside PNG text chunks (default "Serial")
+ * - SCAN_SINCE_UNIX: optional override (unix seconds). Default = 2025-08-27 00:00:00 UTC
+ * - SCAN_RETRY_LIMIT: attempts before giving up and marking seen (default 12)
+ * - SCAN_RETRY_TTL_SEC: TTL for retry counter (default 7200)
+ */
+
 const REDIS = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
 const MEMPOOL = "https://mempool.space/api";
 const CONTENT_HOST = process.env.INSCRIPTION_CONTENT_HOST || "https://ordinals.com/content";
-const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const WATCH_ADDRESSES = (process.env.WATCH_ADDRESSES || "").split(",").map(s => s.trim()).filter(Boolean).slice(0, 20);
-const CHAIN_PAGES = Math.max(1, parseInt(process.env.SCAN_CHAIN_PAGES || "1", 10));
 const PNG_TEXT_KEY_HINT = process.env.PNG_TEXT_KEY_HINT || "Serial";
+
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const WATCH_ADDRESSES = (process.env.WATCH_ADDRESSES || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .slice(0, 20);
+
+const CHAIN_PAGES = Math.max(1, parseInt(process.env.SCAN_CHAIN_PAGES || "1", 10));
+
+// Fixed “since” date: Aug 27, 2025 00:00:00 UTC, unless overridden
+const SCAN_SINCE_UNIX = parseInt(
+  process.env.SCAN_SINCE_UNIX || String(Math.floor(Date.parse("2025-08-27T00:00:00Z") / 1000)),
+  10
+);
+
+// Retry controls for serial-missing txs
+const SCAN_RETRY_LIMIT = Math.max(1, parseInt(process.env.SCAN_RETRY_LIMIT || "12", 10)); // e.g., 12 tries
+const SCAN_RETRY_TTL_SEC = Math.max(60, parseInt(process.env.SCAN_RETRY_TTL_SEC || "7200", 10)); // 2h TTL
 
 export default async function handler(req, res) {
   if (!WATCH_ADDRESSES.length) {
-    return res.status(400).json({ error: "Set WATCH_ADDRESSES env var (comma-separated BTC addresses)" });
+    return res.status(400).json({
+      error: "Set WATCH_ADDRESSES env var (comma-separated BTC addresses)",
+    });
   }
+
   try {
     const results = [];
     for (const addr of WATCH_ADDRESSES) {
       const out = await scanAddress(addr);
-      results.push({ address: addr, found: out.length });
+      results.push({ address: addr, processed: out.length });
     }
-    return res.status(200).json({ ok: true, results });
+    return res.status(200).json({ ok: true, since: SCAN_SINCE_UNIX, results });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ ok: false, error: String(e) });
@@ -33,15 +65,22 @@ export default async function handler(req, res) {
 }
 
 async function scanAddress(address) {
+  // Always include mempool (unconfirmed)
   const mempoolTxs = await safeGetJSON(`${MEMPOOL}/address/${address}/txs/mempool`).catch(() => []);
-  const chainTxs = await fetchChainTxs(address, CHAIN_PAGES);
+
+  // For chain (confirmed), fetch pages then filter by SCAN_SINCE_UNIX
+  const rawChain = await fetchChainTxs(address, CHAIN_PAGES);
+  const chainTxs = rawChain.filter((t) => {
+    const bt = t?.status?.block_time;
+    return typeof bt === "number" && bt >= SCAN_SINCE_UNIX;
+  });
 
   // De-dupe by txid
-  const seen = new Set();
+  const seenSet = new Set();
   const all = [];
   for (const t of [...mempoolTxs, ...chainTxs]) {
-    if (!seen.has(t.txid)) {
-      seen.add(t.txid);
+    if (t?.txid && !seenSet.has(t.txid)) {
+      seenSet.add(t.txid);
       all.push(t);
     }
   }
@@ -49,76 +88,128 @@ async function scanAddress(address) {
   const hits = [];
   for (const tx of all) {
     const txid = tx.txid;
-    // skip if we've already processed this txisd
-    const already = await REDIS.sismember("seen_txids", txid);
-    if (already) continue;
+    const txKey = `tx:${txid}`;
 
-    const outspends = await safeGetJSON(`${MEMPOOL}/tx/${txid}/outspends`).catch(() => null);
-    if (!outspends) continue;
+    // If we've already marked as seen *and* the tx has a serial, skip.
+    // Otherwise, we may retry until serial is obtained or we give up.
+    const alreadySeen = await REDIS.sismember("seen_txids", txid);
+    if (alreadySeen) {
+      const existing = await REDIS.hgetall(txKey);
+      if (existing && existing.serial) continue; // fully processed
+      // If seen but no serial, fall through to give it one more try (rare).
+    }
 
-    const vouts = tx.vout || [];
-    // Heuristic similar to your existing logic: find small-value spend that reveals inscription
-    for (let idx = 0; idx < Math.min(outspends.length, vouts.length); idx++) {
-      const spent = outspends[idx];
-      const vout = vouts[idx] || {};
-      if (!spent?.spent) continue;
+    // Optional per-tx soft lock (avoid concurrent lambdas stepping on each other)
+    const lockKey = `lock:${txid}`;
+    const gotLock = await REDIS.setnx(lockKey, "1");
+    if (!gotLock) continue; // someone else is working on it
+    await REDIS.expire(lockKey, 30); // 30s lock
 
-      // Skip the fee output itself and large change outputs
-      const outAddr = vout.scriptpubkey_address;
-      const value = vout.value || 0;
-      if (outAddr === address) continue;
-      if (value > 10000) continue;
+    try {
+      const outspends = await safeGetJSON(`${MEMPOOL}/tx/${txid}/outspends`).catch(() => null);
+      if (!outspends) continue;
 
-      // The tx that spent this output is the reveal (inscription) tx
-      const revealTxid = spent.txid;
-      if (!revealTxid) continue;
+      const vouts = tx.vout || [];
+      const candidates = [];
+      for (let idx = 0; idx < Math.min(outspends.length, vouts.length); idx++) {
+        const spent = outspends[idx];
+        if (!spent?.spent) continue; // only consider spent outputs (reveal spends)
+        const revealTxid = spent.txid;
+        if (revealTxid) candidates.push(revealTxid);
+      }
 
-      const inscriptionId = `${revealTxid}i0`;
+      // Deduplicate candidate reveal txids
+      const uniqCandidates = [...new Set(candidates)];
+      let inscriptionId = null;
+      let serial = null;
+      let pngText = null;
 
-      // Buyer address: often the first input's address (payer)
+      // Probe up to a few indices for each reveal candidate
+      for (const rtxid of uniqCandidates) {
+        const id = await findPngInscriptionId(rtxid);
+        if (!id) continue;
+
+        // Try to fetch content and parse text chunks
+        try {
+          const buf = await fetchBinary(`${CONTENT_HOST}/${id}`);
+          const { ok, text } = parsePngText(buf);
+          if (ok) {
+            inscriptionId = id;
+            pngText = text;
+            // Prefer explicit hint key, then "serial" (any case), then name, then generic alnum token
+            serial =
+              text[PNG_TEXT_KEY_HINT] ||
+              getCaseInsensitive(text, "serial") ||
+              maybeSerialFromJsonValues(text) ||
+              (text.name && /^[A-Za-z0-9]{10,24}$/.test(String(text.name)) ? String(text.name) : null) ||
+              findAlnumToken(Object.entries(text).map(([k, v]) => `${k}=${v}`).join("\n"));
+            if (serial) break; // stop on first successful parse
+          }
+        } catch {
+          // ignore this candidate, try next
+        }
+      }
+
+      // Buyer address (payer) is usually input[0].prevout.scriptpubkey_address
       const buyerAddr = firstInputAddress(tx);
 
-      // Determine status & timestamps
+      // Timestamps & status
       const isConfirmed = !!tx?.status?.confirmed;
       const seenAt = Math.floor(Date.now() / 1000);
-      const confirmedAt = isConfirmed ? (tx.status.block_time || seenAt) : null;
+      const confirmedAt = isConfirmed ? (tx.status.block_time || seenAt) : "";
 
-      // Fetch inscription content and parse PNG text chunks for serial
-      let serial = null, pngText = null;
-      try {
-        const buf = await fetchBinary(`${CONTENT_HOST}/${inscriptionId}`);
-        const { ok, text } = parsePngText(buf);
-        if (ok) {
-          pngText = text;
-          // Loose extraction: if a key matches "Serial" or we find any 10-char digits
-          serial = text[PNG_TEXT_KEY_HINT] || findSerialInTextMap(text);
-        }
-      } catch (_) { /* ignore content errors */ }
+      // Retry accounting: if we still don't have serial, allow multiple re-tries
+      const retryKey = `retry:${txid}`;
+      const currentRetries = parseInt((await REDIS.get(retryKey)) || "0", 10);
+      const hasSerial = !!serial;
 
-      // Save to Redis atomically
-      const txKey = `tx:${txid}`;
-      await REDIS.multi()
+      // If we never found a real id, at least try i0 so the record carries something
+      const storedInscriptionId = inscriptionId || `${uniqCandidates[0] || txid}i0`;
+
+      // Build write
+      const pipe = REDIS.multi()
         .hset(txKey, {
-          inscriptionId,
+          inscriptionId: storedInscriptionId,
           buyerAddr: buyerAddr || "",
           watchedAddr: address,
           status: isConfirmed ? "confirmed" : "unconfirmed",
           seenAt: String(seenAt),
-          confirmedAt: confirmedAt ? String(confirmedAt) : "",
-          serial: serial || "",
-          pngText: pngText ? JSON.stringify(pngText) : ""
+          confirmedAt: String(confirmedAt || ""),
+          serial: hasSerial ? serial : (await getExistingField(txKey, "serial")) || "",
+          pngText: pngText ? JSON.stringify(pngText) : (await getExistingField(txKey, "pngText")) || "",
+          lastScanAt: String(seenAt),
         })
         .sadd(`addr:${address}:txs`, txid)
-        .sadd("seen_txids", txid)
-        // Optional: keep for 30 days
-        .expire(txKey, 60 * 60 * 24 * 30)
-        .exec();
+        .expire(txKey, 60 * 60 * 24 * 30); // keep 30 days
 
-      hits.push({ txid, inscriptionId, buyerAddr, serial, status: isConfirmed ? "confirmed" : "unconfirmed" });
+      if (hasSerial || isConfirmed || currentRetries + 1 >= SCAN_RETRY_LIMIT) {
+        // Mark complete if: we found serial OR it's confirmed OR we've retried enough
+        pipe.sadd("seen_txids", txid).del(retryKey);
+      } else {
+        // Increment retry counter and keep trying on next scans
+        pipe.incr(retryKey).expire(retryKey, SCAN_RETRY_TTL_SEC);
+      }
+
+      await pipe.exec();
+
+      hits.push({
+        txid,
+        inscriptionId: storedInscriptionId,
+        buyerAddr,
+        serial: hasSerial ? serial : "",
+        status: isConfirmed ? "confirmed" : "unconfirmed",
+        retried: hasSerial ? 0 : currentRetries + 1,
+      });
+    } finally {
+      // Release lock
+      await REDIS.del(lockKey);
     }
   }
+
   return hits;
 }
+
+/* ------------------------ Helpers ------------------------ */
 
 function firstInputAddress(tx) {
   try {
@@ -131,7 +222,6 @@ function firstInputAddress(tx) {
 }
 
 async function fetchChainTxs(address, pages) {
-  // First page
   const out = [];
   let last = null;
   for (let i = 0; i < pages; i++) {
@@ -159,7 +249,29 @@ async function fetchBinary(url) {
   return Buffer.from(await r.arrayBuffer());
 }
 
-// ---- PNG text-chunk parsing (tEXt / zTXt / iTXt) ----
+// Try indices i0..i5; return first that looks like PNG
+async function findPngInscriptionId(txid, maxIndex = 5) {
+  for (let i = 0; i <= maxIndex; i++) {
+    const id = `${txid}i${i}`;
+    try {
+      const buf = await fetchBinary(`${CONTENT_HOST}/${id}`);
+      if (buf && buf.length >= 8 && buf.slice(0, 8).equals(PNG_SIG)) return id;
+    } catch {
+      // ignore and try next
+    }
+  }
+  return null;
+}
+
+async function getExistingField(key, field) {
+  try {
+    return await REDIS.hget(key, field);
+  } catch {
+    return null;
+  }
+}
+
+/* ---- PNG text-chunk parsing (tEXt / zTXt / iTXt) ---- */
 function parsePngText(buf) {
   if (!buf || buf.length < 8 || !buf.slice(0, 8).equals(PNG_SIG)) {
     return { ok: false, text: null };
@@ -167,9 +279,16 @@ function parsePngText(buf) {
   const text = {};
   let off = 8;
   while (off + 8 <= buf.length) {
-    const len = buf.readUInt32BE(off); off += 4;
-    const type = buf.slice(off, off + 4).toString("latin1"); off += 4;
-    const data = buf.slice(off, off + len); off += len;
+    if (off + 8 > buf.length) break;
+    const len = buf.readUInt32BE(off);
+    off += 4;
+    const type = buf.slice(off, off + 4).toString("latin1");
+    off += 4;
+
+    if (off + len > buf.length) break;
+    const data = buf.slice(off, off + len);
+    off += len;
+
     off += 4; // skip CRC
 
     if (type === "tEXt") {
@@ -187,7 +306,7 @@ function parsePngText(buf) {
         const compData = data.slice(zero + 2);
         if (compMethod === 0) {
           try {
-            const v = zlib.unzipSync(compData).toString("latin1");
+            const v = zlib.unzipSync(compData).toString("utf-8");
             text[k] = v;
           } catch (e) {
             text[k] = `<zTXt decompress error: ${e}>`;
@@ -195,23 +314,21 @@ function parsePngText(buf) {
         }
       }
     } else if (type === "iTXt") {
-      // keyword\0comp_flag\0comp_method\0lang\0translated\0text
+      // keyword\0comp_flag\0comp_method\0lang\0translated\0text (payload)
       const parts = splitNul(data, 6);
       if (parts && parts.length === 6) {
         const [k, compFlag, compMethod, _lang, _trans, payload] = parts;
         try {
           let v;
-          if (compFlag?.[0] === 1) {
-            v = zlib.unzipSync(payload).toString("utf-8");
-          } else {
-            v = Buffer.from(payload).toString("utf-8");
-          }
+          if (compFlag?.[0] === 1) v = zlib.unzipSync(payload).toString("utf-8");
+          else v = Buffer.from(payload).toString("utf-8");
           text[k.toString("latin1")] = v;
         } catch (e) {
           text[k.toString("latin1")] = `<iTXt error: ${e}>`;
         }
       }
     }
+
     if (type === "IEND") break;
   }
   return { ok: Object.keys(text).length > 0, text };
@@ -230,13 +347,37 @@ function splitNul(buf, maxParts) {
   return out;
 }
 
-function findSerialInTextMap(obj) {
-  // Try common keys or extract first 10-digit sequence
-  const keys = Object.keys(obj);
-  for (const k of keys) {
-    if (/serial/i.test(k)) return obj[k];
+/* ---- Serial extraction helpers ---- */
+
+function getCaseInsensitive(mapObj, key) {
+  const keys = Object.keys(mapObj || {});
+  const k = keys.find((k) => k.toLowerCase() === String(key).toLowerCase());
+  return k ? mapObj[k] : undefined;
+}
+
+// If a text value is itself JSON (e.g., {"name":"...","serial":"..."}), pull serial out
+function maybeSerialFromJsonValues(textMap) {
+  for (const v of Object.values(textMap || {})) {
+    if (typeof v !== "string") continue;
+    const trimmed = v.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      const s =
+        obj?.serial ||
+        obj?.Serial ||
+        (obj?.name && /^[A-Za-z0-9]{10,24}$/.test(String(obj.name)) ? obj.name : null);
+      if (s) return String(s);
+    } catch {
+      // not JSON; continue
+    }
   }
-  const joined = keys.map(k => `${k}=${obj[k]}`).join("\n");
-  const m = joined.match(/\b\d{10}\b/);
+  return null;
+}
+
+// Last-resort: pull a 10–24 char alphanumeric token from blob text
+function findAlnumToken(s) {
+  if (typeof s !== "string") return null;
+  const m = s.match(/\b[A-Za-z0-9]{10,24}\b/);
   return m ? m[0] : null;
 }
