@@ -54,9 +54,26 @@ export default async function handler(req, res) {
   try {
     const results = [];
     for (const addr of WATCH_ADDRESSES) {
-      const out = await scanAddress(addr);
+      const out = await scanAddress(addr); // <-- your existing function
       results.push({ address: addr, processed: out.length });
     }
+
+    // 🔔 Minimal addition: trigger your backend rebuild after the scan
+    const rebuildUrl = process.env.REBUILD_URL; // e.g. https://nekoback.onrender.com/admin/rebuild_used_serials
+    if (rebuildUrl) {
+      try {
+        await fetch(rebuildUrl, {
+          method: "POST",
+          headers: { "X-Internal-Token": process.env.INTERNAL_TOKEN || "" },
+        });
+      } catch (e) {
+        console.error("Rebuild call failed:", e);
+        // Non-fatal: still return 200 for the scan itself
+      }
+    } else {
+      console.warn("REBUILD_URL not set; skipping rebuild call");
+    }
+
     return res.status(200).json({ ok: true, since: SCAN_SINCE_UNIX, results });
   } catch (e) {
     console.error(e);
