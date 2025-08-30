@@ -196,8 +196,11 @@ async function scanAddress(address) {
           pngText: pngText ? JSON.stringify(pngText) : (await getExistingField(txKey, "pngText")) || "",
           lastScanAt: String(seenAt),
         })
-        .sadd(`addr:${address}:txs`, txid)
-        .expire(txKey, 60 * 60 * 24 * 30); // keep 30 days
+        .sadd(`addr:${address}:txs`, txid);
+
+       if (buyerAddr) pipe.sadd(`buyer:${buyerAddr}:txs`, txid);  // ✅ add this line right here
+
+       pipe.expire(txKey, 60 * 60 * 24 * 30); // keep 30 days 
 
       if (hasSerial || isConfirmed || currentRetries + 1 >= SCAN_RETRY_LIMIT) {
         // Mark complete if: we found serial OR it's confirmed OR we've retried enough
