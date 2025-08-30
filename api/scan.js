@@ -197,7 +197,6 @@ async function scanAddress(address) {
           lastScanAt: String(seenAt),
         })
         .sadd(`addr:${address}:txs`, txid)
-		if (buyerAddr) pipe.sadd(`buyer:${buyerAddr}:txs`, txid);
         .expire(txKey, 60 * 60 * 24 * 30); // keep 30 days
 
       if (hasSerial || isConfirmed || currentRetries + 1 >= SCAN_RETRY_LIMIT) {
