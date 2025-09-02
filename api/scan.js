@@ -1,8 +1,12 @@
+export const runtime = "nodejs";
+
+
 // api/scan.js
 import { Redis } from "@upstash/redis";
 import fetch from "node-fetch";
 import zlib from "zlib";
 import { fileURLToPath } from "url";
+
 
 /**
  * ENV
@@ -28,8 +32,10 @@ const REDIS = new Redis({
 
 const MEMPOOL = "https://mempool.space/api"; // used for mempool (unconfirmed) + as outspends fallback
 const BLOCKCHAIR = "https://api.blockchair.com/bitcoin";
-const BLOCKCHAIR_API_KEY =
-  process.env.BLOCKCHAIR_API_KEY || "A___EkBH6Aj4164jLg94f9mNY0npB7uz"; // <-- replace in prod
+const BLOCKCHAIR_API_KEY = process.env.BLOCKCHAIR_API_KEY;
+if (!BLOCKCHAIR_API_KEY) {
+  throw new Error("BLOCKCHAIR_API_KEY is not set");
+}
 
 const PNG_TEXT_KEY_HINT = process.env.PNG_TEXT_KEY_HINT || "Serial";
 const HIRO_API_KEY = process.env.HIRO_API_KEY || "";
