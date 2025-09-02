@@ -66,11 +66,11 @@ const SCAN_SINCE_UNIX = parseInt(
 // Retry controls for serial-missing txs
 const SCAN_RETRY_LIMIT = Math.max(
   1,
-  parseInt(process.env.SCAN_RETRY_LIMIT || "12", 10)
+  parseInt(process.env.SCAN_RETRY_LIMIT || "60", 10) // up to ~5 hours at 5m cadence
 );
 const SCAN_RETRY_TTL_SEC = Math.max(
-  60,
-  parseInt(process.env.SCAN_RETRY_TTL_SEC || "7200", 10)
+  10,                                   // allow very fast cycles
+  parseInt(process.env.SCAN_RETRY_TTL_SEC || "300", 10)  // default 5 min
 );
 
 // =========================== Next.js API handler ===========================
@@ -250,13 +250,17 @@ async function scanAddress(address) {
       if (buyerAddr) pipe.sadd(`buyer:${buyerAddr}:txs`, txid); // keep buyer index
       pipe.expire(txKey, 60 * 60 * 24 * 30); // keep 30 days
 
-      if (hasSerial || isConfirmed || currentRetries + 1 >= SCAN_RETRY_LIMIT) {
+      if (hasSerial || currentRetries + 1 >= SCAN_RETRY_LIMIT) {
         // Mark complete
         pipe.sadd("seen_txids", txid).del(retryKey);
       } else {
         // Keep retrying later
-        pipe.incr(retryKey).expire(retryKey, SCAN_RETRY_TTL_SEC);
-      }
+        const burstTtl = 20; // seconds, fast rechecks at the start
+        const burstTries = 9; // ~3 minutes of rapid retries (9 * 20s)
+        const nextTtl = currentRetries < burstTries ? burstTtl : SCAN_RETRY_TTL_SEC;
+        pipe.incr(retryKey).expire(retryKey, nextTtl);
+		
+	  }		
 
       await pipe.exec();
 
