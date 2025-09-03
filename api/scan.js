@@ -1,12 +1,10 @@
 export const runtime = "nodejs";
 
-
 // api/scan.js
 import { Redis } from "@upstash/redis";
 import fetch from "node-fetch";
 import zlib from "zlib";
 import { fileURLToPath } from "url";
-
 
 /**
  * ENV
@@ -54,7 +52,10 @@ const WATCH_ADDRESSES = (process.env.WATCH_ADDRESSES || "")
   .filter(Boolean)
   .slice(0, 20);
 
-const CHAIN_PAGES = Math.max(1, parseInt(process.env.SCAN_CHAIN_PAGES || "1", 10));
+const CHAIN_PAGES = Math.max(
+  1,
+  parseInt(process.env.SCAN_CHAIN_PAGES || "1", 10)
+);
 
 // Fixed “since” date: Aug 27, 2025 00:00:00 UTC, unless overridden
 const SCAN_SINCE_UNIX = parseInt(
@@ -69,8 +70,8 @@ const SCAN_RETRY_LIMIT = Math.max(
   parseInt(process.env.SCAN_RETRY_LIMIT || "60", 10) // up to ~5 hours at 5m cadence
 );
 const SCAN_RETRY_TTL_SEC = Math.max(
-  10,                                   // allow very fast cycles
-  parseInt(process.env.SCAN_RETRY_TTL_SEC || "300", 10)  // default 5 min
+  10, // allow very fast cycles
+  parseInt(process.env.SCAN_RETRY_TTL_SEC || "300", 10) // default 5 min
 );
 
 // =========================== Next.js API handler ===========================
@@ -226,7 +227,8 @@ async function scanAddress(address) {
       const hasSerial = !!serial;
 
       // If no real id, at least try i0 so the record carries something
-      const storedInscriptionId = inscriptionId || `${uniqCandidates[0] || txid}i0`;
+      const storedInscriptionId =
+        inscriptionId || `${uniqCandidates[0] || txid}i0`;
 
       // Build write
       const pipe = REDIS.multi()
@@ -257,10 +259,16 @@ async function scanAddress(address) {
         // Keep retrying later
         const burstTtl = 20; // seconds, fast rechecks at the start
         const burstTries = 9; // ~3 minutes of rapid retries (9 * 20s)
-        const nextTtl = currentRetries < burstTries ? burstTtl : SCAN_RETRY_TTL_SEC;
+        const nextTtl =
+          currentRetries < burstTries ? burstTtl : SCAN_RETRY_TTL_SEC;
         pipe.incr(retryKey).expire(retryKey, nextTtl);
-		
-	  }		
+      }
+
+      // NEW: count this serial immediately (includes unconfirmed hits).
+      // SADD is a set add: safe to call again later when it confirms (no duplicates).
+      if (hasSerial) {
+        pipe.sadd("used_serials", serial);
+      }
 
       await pipe.exec();
 
@@ -500,7 +508,8 @@ function parsePngText(buf) {
         const [k, compFlag, compMethod, _lang, _trans, payload] = parts;
         try {
           let v;
-          if (compFlag?.[0] === 1) v = zlib.unzipSync(payload).toString("utf-8");
+          if (compFlag?.[0] === 1)
+            v = zlib.unzipSync(payload).toString("utf-8");
           else v = Buffer.from(payload).toString("utf-8");
           text[k.toString("latin1")] = v;
         } catch (e) {
@@ -530,9 +539,7 @@ function splitNul(buf, maxParts) {
 /* ---- Serial extraction helpers ---- */
 function getCaseInsensitive(mapObj, key) {
   const keys = Object.keys(mapObj || {});
-  const k = keys.find(
-    (k) => k.toLowerCase() === String(key).toLowerCase()
-  );
+  const k = keys.find((k) => k.toLowerCase() === String(key).toLowerCase());
   return k ? mapObj[k] : undefined;
 }
 
@@ -577,9 +584,13 @@ if (isRunDirectly(import.meta.url)) {
         );
         process.exit(1);
       }
-      const pages = args.pages ? Math.max(1, parseInt(args.pages, 10)) : CHAIN_PAGES;
+      const pages = args.pages
+        ? Math.max(1, parseInt(args.pages, 10))
+        : CHAIN_PAGES;
       const res = await scanAddress(args.addr);
-      console.log(JSON.stringify({ ok: true, address: args.addr, hits: res }, null, 2));
+      console.log(
+        JSON.stringify({ ok: true, address: args.addr, hits: res }, null, 2)
+      );
       process.exit(0);
     } catch (e) {
       console.error(e);
